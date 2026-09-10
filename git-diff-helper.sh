@@ -21,7 +21,7 @@
 set -uo pipefail
 
 SCRIPT_NAME="$(basename -- "$0")"
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 #------------------------------------------------------------------------------
 # 既定値
@@ -33,6 +33,9 @@ SELECT_BRANCH_DEFAULT="main"
 SELECT_BRANCH_SET=0
 HISTORY_BRANCH=""
 HISTORY_TIP=""
+COMMIT_REFS=()
+SELECTED_COMMITS=()
+declare -A SELECTED_SET=()
 BACK=1
 REPO="."
 OUTDIR=""
@@ -94,6 +97,8 @@ usage() {
              別名: range    ※ -f / -t で指定
   interactive ブランチと2コミットを対話的に選択         … git diff <from> <to>
              別名: select   ※ ブランチ既定 main、履歴は10件ずつ表示
+  multi      複数コミットの変更をファイル単位で集約       … 各コミットの親との差分
+             別名: multi-select  ※ 対話選択、または -c を繰り返して指定
   branches   ブランチ同士の変更                          … git diff <from>...<to>
              別名: branch   ※ -f / -t で指定 (既定は三点比較)
   remote     リモート追跡ブランチ ⇔ ローカル HEAD        … git diff <upstream> HEAD
@@ -102,7 +107,8 @@ usage() {
 【主なオプション】
   -f, --from <REF>       比較元 (コミット / ブランチ / タグ / SHA)
   -t, --to   <REF>       比較先 (省略時は HEAD)
-  -b, --branch <BRANCH>  interactive のブランチ選択の既定値 (既定: main)
+  -b, --branch <BRANCH>  interactive / multi のブランチ選択の既定値 (既定: main)
+  -c, --commit <REF>     multi の対象コミット (繰り返し指定可、省略時は対話選択)
   -n, --back <N>         prev モードで N 個前のコミットと比較 (既定: 1)
   -r, --repo <DIR>       対象リポジトリのパス (既定: カレントディレクトリ)
   -o, --outdir <DIR>     出力先ディレクトリ (既定: ./git-diff-report)
@@ -153,6 +159,10 @@ usage() {
   ./git-diff-helper.sh -m interactive
   ./git-diff-helper.sh -m interactive -b develop -r /srv/git/myapp
 
+  # 複数選択 (番号を空白/カンマ区切りで切替、n/p: ページ移動、d: 確定、q: 中止)
+  ./git-diff-helper.sh -m multi
+  ./git-diff-helper.sh -m multi -c a1b2c3d -c f9e8d7c
+
   # ブランチ間の差分 (main を基点にした feature の変更)
   ./git-diff-helper.sh -m branches -f main -t feature/login
 
@@ -186,6 +196,7 @@ prev        last                HEAD~N ⇔ HEAD  (-n で N 指定)
 commit                          指定コミットの親 ⇔ 指定コミット (-f)
 commits     range               指定した2コミット間 (-f, -t)
 interactive select              ブランチと2コミットを選択 (既定 main / 10件ずつ)
+multi       multi-select        選択コミットの親との差分を集約 (対話選択 / -c を反復)
 branches    branch              ブランチ同士 (-f, -t)
 remote      upstream            リモート追跡ブランチ ⇔ HEAD (-t で明示指定)
 EOS
@@ -201,6 +212,7 @@ parse_args() {
       -f|--from)            [[ $# -ge 2 ]] || die "$1 には値が必要です"; FROM="$2"; shift 2 ;;
       -t|--to)              [[ $# -ge 2 ]] || die "$1 には値が必要です"; TO="$2"; shift 2 ;;
       -b|--branch)          [[ $# -ge 2 && -n "$2" ]] || die "$1 には値が必要です"; SELECT_BRANCH_DEFAULT="$2"; SELECT_BRANCH_SET=1; shift 2 ;;
+      -c|--commit)          [[ $# -ge 2 && -n "$2" ]] || die "$1 には値が必要です"; COMMIT_REFS+=("$2"); shift 2 ;;
       -n|--back)            [[ $# -ge 2 ]] || die "$1 には値が必要です"; BACK="$2"; shift 2 ;;
       -r|--repo)            [[ $# -ge 2 ]] || die "$1 には値が必要です"; REPO="$2"; shift 2 ;;
       -o|--outdir)          [[ $# -ge 2 ]] || die "$1 には値が必要です"; OUTDIR="$2"; shift 2 ;;
@@ -303,7 +315,7 @@ has_head() { "${GIT[@]}" rev-parse --verify --quiet HEAD >/dev/null 2>&1; }
 #------------------------------------------------------------------------------
 read_selection() {
   printf '%s' "$1" >&2
-  IFS= read -r SELECTION_INPUT || die "選択入力が終了しました。対話操作を行うか、-m commits -f <元> -t <先> を指定してください。"
+  IFS= read -r SELECTION_INPUT || die "選択入力が終了しました。対話操作を行うか、-m commits -f <元> -t <先> / -m multi -c <対象> ... を指定してください。"
   SELECTION_INPUT="${SELECTION_INPUT%$'\r'}"
   case "$SELECTION_INPUT" in
     q|Q) info "コミット選択を中止しました。"; exit 0 ;;
@@ -364,8 +376,9 @@ select_history_branch() {
 
 select_history_commit() {
   local prompt="$1" excluded="${2:-}" page=0 page_size=10 page_output oid details
-  local count has_next i
-  local hashes=() labels=()
+  local multiple="${3:-0}" count has_next i marker token valid
+  local hashes=() labels=() choices=() pending=() remaining=()
+  local -A seen_choice=()
   while :; do
     # 1件先読みして次ページの有無を判定し、全履歴の読み込み・件数集計を避ける。
     page_output="$("${GIT[@]}" --no-pager log --no-color --no-decorate --no-notes \
@@ -387,9 +400,19 @@ select_history_commit() {
       "$prompt" "$HISTORY_BRANCH" "$((page + 1))" "$((page * page_size + 1))" "$((page * page_size + count))" >&2
     printf '  番号  コミット  日時  作成者  件名\n' >&2
     for ((i = 0; i < count; i++)); do
-      printf '  %2d) %s\n' "$((i + 1))" "${labels[i]}" >&2
+      marker=""
+      if ((multiple)); then
+        marker="[ ] "
+        [[ -n "${SELECTED_SET[${hashes[i]}]:-}" ]] && marker="[x] "
+      fi
+      printf '  %2d) %s%s\n' "$((i + 1))" "$marker" "${labels[i]}" >&2
     done
-    printf '  番号: 選択 / n: 次の10件 / p: 前の10件 / q: 中止 (入力後 Enter)\n' >&2
+    if ((multiple)); then
+      printf '  選択済み: %d 件 / 番号: 選択・解除 (例: 1 3 または 1,3) / d: 確定\n' "${#SELECTED_COMMITS[@]}" >&2
+      printf '  n: 次の10件 / p: 前の10件 / q: 中止 (入力後 Enter)\n' >&2
+    else
+      printf '  番号: 選択 / n: 次の10件 / p: 前の10件 / q: 中止 (入力後 Enter)\n' >&2
+    fi
     read_selection '選択: '
     case "$SELECTION_INPUT" in
       n|N)
@@ -399,6 +422,44 @@ select_history_commit() {
         if ((page > 0)); then page=$((page - 1)); else warn "最初のページです。"; fi
         ;;
       *)
+        if ((multiple)); then
+          if [[ "$SELECTION_INPUT" == "d" || "$SELECTION_INPUT" == "D" ]]; then
+            ((${#SELECTED_COMMITS[@]} > 0)) && return 0
+            warn "1件以上のコミットを選択してください。"
+            continue
+          fi
+          IFS=$' \t' read -r -a choices <<< "${SELECTION_INPUT//,/ }"
+          pending=(); seen_choice=(); valid=1
+          ((${#choices[@]} > 0)) || valid=0
+          # 全番号を先に検証し、不正な入力では選択状態を一切変えない。
+          for token in "${choices[@]}"; do
+            for ((i = 0; i < count; i++)); do
+              [[ "$token" == "$((i + 1))" ]] && break
+            done
+            if ((i == count)); then valid=0; break; fi
+            oid="${hashes[i]}"
+            if [[ -z "${seen_choice[$oid]:-}" ]]; then
+              pending+=("$oid"); seen_choice[$oid]=1
+            fi
+          done
+          if ((valid == 0)); then
+            warn "表示中の番号 (1～${count}) を空白／カンマで区切るか、n、p、d、q を入力してください。"
+            continue
+          fi
+          for oid in "${pending[@]}"; do
+            if [[ -n "${SELECTED_SET[$oid]:-}" ]]; then
+              unset 'SELECTED_SET[$oid]'
+            else
+              SELECTED_SET[$oid]=1; SELECTED_COMMITS+=("$oid")
+            fi
+          done
+          remaining=()
+          for oid in "${SELECTED_COMMITS[@]}"; do
+            [[ -n "${SELECTED_SET[$oid]:-}" ]] && remaining+=("$oid")
+          done
+          SELECTED_COMMITS=("${remaining[@]}")
+          continue
+        fi
         for ((i = 0; i < count; i++)); do
           if [[ "$SELECTION_INPUT" == "$((i + 1))" ]]; then
             if [[ "${hashes[i]}" == "$excluded" ]]; then
@@ -429,6 +490,24 @@ select_commit_range() {
   TO="$SELECTED_COMMIT"
 }
 
+select_multiple_commits() {
+  local ref oid
+  if ((${#COMMIT_REFS[@]})); then
+    ((SELECT_BRANCH_SET == 0)) || die "-c / --commit と --branch は併用できません。"
+    for ref in "${COMMIT_REFS[@]}"; do
+      oid="$("${GIT[@]}" rev-parse --verify --end-of-options "${ref}^{commit}")" \
+        || die "対象コミットが解決できません: $ref"
+      if [[ -z "${SELECTED_SET[$oid]:-}" ]]; then
+        SELECTED_COMMITS+=("$oid"); SELECTED_SET[$oid]=1
+      fi
+    done
+  else
+    select_history_branch
+    info "各コミットの親との差分を集約します。番号で選択・解除し、d で確定してください。"
+    select_history_commit "複数コミット選択" "" 1
+  fi
+}
+
 #------------------------------------------------------------------------------
 # モード解決  →  RANGE / 各種ラベルを決定
 #------------------------------------------------------------------------------
@@ -445,14 +524,18 @@ resolve_mode() {
     commit)                   MODE="commit" ;;
     commits|range)            MODE="commits" ;;
     interactive|select)       MODE="interactive" ;;
+    multi|multi-select)       MODE="multi" ;;
     branch|branches)          MODE="branches" ;;
     remote|upstream)          MODE="remote" ;;
     "")  usage; echo; die "モードが指定されていません。 -m <モード> を指定してください。" ;;
     *)   die "不明なモード: $MODE  ( -l でモード一覧を表示 )" ;;
   esac
 
-  if ((SELECT_BRANCH_SET)) && [[ "$MODE" != "interactive" ]]; then
-    die "--branch は interactive モードで使用してください。"
+  if ((SELECT_BRANCH_SET)) && [[ "$MODE" != "interactive" && "$MODE" != "multi" ]]; then
+    die "--branch は interactive / multi モードで使用してください。"
+  fi
+  if ((${#COMMIT_REFS[@]})) && [[ "$MODE" != "multi" ]]; then
+    die "-c / --commit は multi モードで使用してください。"
   fi
 
   case "$MODE" in
@@ -546,6 +629,15 @@ resolve_mode() {
       SIDE_R="$TO ($("${GIT[@]}" rev-parse --short "$TO"))"
       MODE_NOTE="指定した2つのコミット間の変更を確認します。"
       ;;
+    multi)
+      [[ -z "$FROM" && -z "$TO" ]] || die "multi モードでは -f / -t を使わず、対話選択または -c でコミットを指定してください。"
+      [[ "$MERGE_BASE" != "yes" ]] || die "multi モードでは --merge-base は指定できません。"
+      select_multiple_commits
+      MODE_DESC="選択した ${#SELECTED_COMMITS[@]} コミットの変更を集約"
+      SIDE_L="各コミットの第1親 (初回コミットは空ツリー)"
+      SIDE_R="選択コミット (選択順)"
+      MODE_NOTE="選択コミットごとの追加・削除行数を合算します。同一パスを集約し、変更を相殺しません。明細の行番号は各コミットの親／対象に対応します。"
+      ;;
     branches)
       [[ -n "$FROM" ]] || die "branches モードでは -f <ブランチ> を指定してください。"
       [[ -n "$TO" ]] || { TO="HEAD"; info "-t が未指定のため比較先を HEAD にします。"; }
@@ -604,9 +696,10 @@ build_diff_opts() {
   if ((FIND_RENAMES)); then DIFF_COMMON+=(-M); else DIFF_COMMON+=(--no-renames); fi
   ((IGNORE_SPACE)) && DIFF_COMMON+=(-w)
   PS_ARGS=()
-  [[ "$MODE" == "interactive" ]] && PS_ARGS=(--)
+  [[ "$MODE" == "interactive" || "$MODE" == "multi" ]] && PS_ARGS=(--)
   ((${#PATHSPEC[@]})) && PS_ARGS=(-- "${PATHSPEC[@]}")
   DIFF_CMD_DISPLAY="git diff ${DIFF_COMMON[*]} -U${CONTEXT}"
+  [[ "$MODE" == "multi" ]] && DIFF_CMD_DISPLAY+=" <各コミットの第1親/空ツリー> <選択コミット>"
   ((${#RANGE[@]}))    && DIFF_CMD_DISPLAY+=" ${RANGE[*]}"
   ((${#PS_ARGS[@]}))  && DIFF_CMD_DISPLAY+=" ${PS_ARGS[*]}"
 }
@@ -701,6 +794,55 @@ function emit(kind, ol, nl, txt) {
   else if (c == "-") { emit("del", ol, "", t); ol++ }
   else if (c == " ") { emit("ctx", ol, nl, t); ol++; nl++ }
   else if (c == "\\"){ emit("note", "", "", $0) }
+}
+AWKEOF
+
+#--- 選択コミットのファイルを集約し、明細をファイル→選択順に並べる -----------
+cat >"$TMPD/selected.awk" <<'AWKEOF'
+BEGIN { US = sprintf("%c", 31); FS = OFS = US }
+function append_line(id, text,   name) {
+  # 大きな差分をメモリに蓄積せず、数値IDの一時ファイルに保存する。
+  name = dir "/" id ".dat"
+  if (name != output) {
+    if (output != "") close(output)
+    output = name
+  }
+  print text >> output
+}
+$1 == "SELECT" { commit = $2; parent = $3; selection++; next }
+$1 == "COMMIT" { commits[++ncommit] = $0; next }
+$1 == "FILE" {
+  key = "path:" $8
+  id = bypath[key]
+  if (!id) {
+    id = ++nfile; bypath[key] = id
+    state[id] = $3; oldp[id] = $7; newp[id] = $8; sim[id] = $10
+  } else if (state[id] != $3 || oldp[id] != $7) {
+    state[id] = "M"; oldp[id] = newp[id]; sim[id] = ""
+  }
+  if (!seen[id, $4]++) code[id] = code[id] (code[id] == "" ? "" : "/") $4
+  adds[id] += $5; dels[id] += $6
+  if ($9) binary[id] = 1
+  byidx[selection, $2] = id
+  append_line(id, "LINE" US id US 0 US "" US "" US "meta" US \
+    "コミット: " commit " / 親: " parent " / 状態: " $4)
+  next
+}
+$1 == "LINE" {
+  $2 = byidx[selection, $2]
+  append_line($2, $0)
+}
+END {
+  if (output != "") close(output)
+  for (i = 1; i <= nfile; i++)
+    print "FILE", i, state[i], code[i], adds[i]+0, dels[i]+0, oldp[i], newp[i], binary[i]+0, sim[i]
+  for (i = 1; i <= ncommit; i++) print commits[i]
+  for (i = 1; i <= nfile; i++) {
+    name = dir "/" i ".dat"
+    while ((rc = (getline line < name)) > 0) print line
+    close(name)
+    if (rc < 0) exit 1
+  }
 }
 AWKEOF
 
@@ -1323,16 +1465,76 @@ AWKEOF
 #==============================================================================
 # データ収集 → report.dat
 #==============================================================================
+collect_diff_outputs() {
+  git_diff --name-status -z | tr '\000' '\n' > "$TMPD/namestatus.txt" \
+    || die "git diff --name-status の実行に失敗しました。"
+  git_diff --numstat -z | tr '\000' '\n' > "$TMPD/numstat.txt" \
+    || die "git diff --numstat の実行に失敗しました。"
+  git_diff "--unified=${CONTEXT}" > "$TMPD/current.patch" \
+    || die "git diff のパッチ取得に失敗しました。"
+}
+
+selected_commit_parent() {
+  local headers field value
+  headers="$("${GIT[@]}" cat-file -p "$1")" || die "コミットの読み取りに失敗しました: $1"
+  SELECTED_PARENT=""
+  # shallow 境界を初回コミットと誤認しないよう、オブジェクトの親を直接調べる。
+  while IFS=' ' read -r field value; do
+    [[ -n "$field" ]] || break
+    if [[ "$field" == "parent" ]]; then SELECTED_PARENT="$value"; break; fi
+  done <<< "$headers"
+  if [[ -n "$SELECTED_PARENT" ]]; then
+    verify_ref "$SELECTED_PARENT" \
+      || die "親コミットが取得できません: $1 (親: $SELECTED_PARENT)。不足する履歴を取得してください。"
+  else
+    SELECTED_PARENT="$("${GIT[@]}" hash-object -t tree --stdin </dev/null)" \
+      || die "空ツリーの識別子を取得できません。"
+  fi
+}
+
+collect_selected_data() {
+  local oid records="$TMPD/selected.dat"
+  : > "$records" || die "作業ファイルを作成できません。"
+  : > "$TMPD/patch.txt" || die "パッチファイルを作成できません。"
+  mkdir "$TMPD/selected-lines" || die "明細の作業ディレクトリを作成できません。"
+  for oid in "${SELECTED_COMMITS[@]}"; do
+    selected_commit_parent "$oid"
+    RANGE=("$SELECTED_PARENT" "$oid")
+    collect_diff_outputs
+    printf 'SELECT%s%s%s%s\n' "$US" "$oid" "$US" "$SELECTED_PARENT" >> "$records" \
+      || die "選択コミット情報の保存に失敗しました。"
+    "${GIT[@]}" --no-pager log -1 --no-color --no-decorate --no-notes \
+      --no-show-signature --no-patch --date=format:'%Y-%m-%d %H:%M:%S %z' \
+      --format="COMMIT${US}%H${US}%ad${US}%an${US}%s" "$oid" -- >> "$records" \
+      || die "選択コミットの履歴取得に失敗しました: $oid"
+    "${AWK[@]}" -f "$TMPD/files.awk" "$TMPD/namestatus.txt" "$TMPD/numstat.txt" >> "$records" \
+      || die "選択コミットのファイル一覧の解析に失敗しました: $oid"
+    "${AWK[@]}" -f "$TMPD/patch.awk" "$TMPD/current.patch" >> "$records" \
+      || die "選択コミットのパッチ解析に失敗しました: $oid"
+    printf '# commit: %s\n# parent: %s\n' "$oid" "$SELECTED_PARENT" >> "$TMPD/patch.txt" \
+      || die "パッチの見出しの保存に失敗しました。"
+    cat "$TMPD/current.patch" >> "$TMPD/patch.txt" || die "パッチの保存に失敗しました。"
+  done
+  "${AWK[@]}" -v dir="$TMPD/selected-lines" -f "$TMPD/selected.awk" "$records" > "$TMPD/changes.dat" \
+    || die "選択コミットの集約に失敗しました。"
+}
+
 collect_data() {
-  local ns="$TMPD/namestatus.txt" nu="$TMPD/numstat.txt"
-
-  git_diff --name-status -z | tr '\000' '\n' > "$ns"
-  local rc=${PIPESTATUS[0]}
-  ((rc == 0)) || die "git diff の実行に失敗しました (終了コード: $rc)"
-
-  git_diff --numstat -z | tr '\000' '\n' > "$nu"
-
-  git_diff "--unified=${CONTEXT}" > "$TMPD/patch.txt"
+  if [[ "$MODE" == "multi" ]]; then
+    collect_selected_data
+  else
+    collect_diff_outputs
+    cp "$TMPD/current.patch" "$TMPD/patch.txt" || die "パッチの保存に失敗しました。"
+    "${AWK[@]}" -f "$TMPD/files.awk" "$TMPD/namestatus.txt" "$TMPD/numstat.txt" > "$TMPD/changes.dat" \
+      || die "ファイル一覧の解析に失敗しました。"
+    if [[ -n "$LOG_RANGE" ]]; then
+      "${GIT[@]}" log --date=format:'%Y-%m-%d %H:%M:%S' \
+        --format="COMMIT${US}%h${US}%ad${US}%an${US}%s" "$LOG_RANGE" >> "$TMPD/changes.dat" \
+        || die "コミット履歴の取得に失敗しました。"
+    fi
+    "${AWK[@]}" -f "$TMPD/patch.awk" "$TMPD/patch.txt" >> "$TMPD/changes.dat" \
+      || die "パッチの解析に失敗しました。"
+  fi
 
   {
     # --- META ---
@@ -1346,6 +1548,10 @@ collect_data() {
     fi
     printf 'META%s%s%s%s\n' "$US" "モード"         "$US" "$MODE"
     printf 'META%s%s%s%s\n' "$US" "比較内容"       "$US" "$MODE_DESC"
+    if [[ "$MODE" == "multi" ]]; then
+      printf 'META%s%s%s%s\n' "$US" "選択コミット数" "$US" "${#SELECTED_COMMITS[@]}"
+      printf 'META%s%s%s%s\n' "$US" "集約単位" "$US" "変更後のパス (削除時は変更前)。状態が混在する場合は変更 (M)。"
+    fi
     printf 'META%s%s%s%s\n' "$US" "比較元 (左)"    "$US" "$SIDE_L"
     printf 'META%s%s%s%s\n' "$US" "比較先 (右)"    "$US" "$SIDE_R"
     printf 'META%s%s%s%s\n' "$US" "説明"           "$US" "$MODE_NOTE"
@@ -1362,19 +1568,9 @@ collect_data() {
     fi
     ((IGNORE_SPACE)) && printf 'META%s%s%s%s\n' "$US" "オプション" "$US" "空白差分を無視 (-w)"
 
-    # --- FILE ---
-    "${AWK[@]}" -f "$TMPD/files.awk" "$ns" "$nu"
-
-    # --- COMMIT ---
-    if [[ -n "$LOG_RANGE" ]]; then
-      "${GIT[@]}" log --date=format:'%Y-%m-%d %H:%M:%S' \
-        --pretty=format:"COMMIT${US}%h${US}%ad${US}%an${US}%s" "$LOG_RANGE" 2>/dev/null
-      echo
-    fi
-
-    # --- LINE ---
-    "${AWK[@]}" -f "$TMPD/patch.awk" "$TMPD/patch.txt"
-  } | grep -v '^$' > "$TMPD/report.dat"
+    # --- FILE / COMMIT / LINE ---
+    cat "$TMPD/changes.dat"
+  } | grep -v '^$' > "$TMPD/report.dat" || die "レポートデータの保存に失敗しました。"
 
   return 0
 }
@@ -1790,8 +1986,9 @@ man_sheet_cover() {
     [[ -z "$a" ]] && continue
     MAN_Z=$((MAN_ROW % 2)); man_row "" label "$a" plain "$b"
   done <<'EOS'
-9 種類のモードに対応|ワークツリー / ステージ / HEAD / 直近 N コミット / 特定コミット / 2 コミット間 / 対話選択 / ブランチ間 / リモート追跡ブランチ を -m で切り替えられます。
+10 種類のモードに対応|ワークツリー / ステージ / HEAD / 直近 N コミット / 特定コミット / 2 コミット間 / 対話選択 / 複数コミット集約 / ブランチ間 / リモート追跡ブランチ を -m で切り替えられます。
 履歴から2コミットを選択|interactive モードでブランチを選択 (既定 main) し、10件ずつの履歴から比較元と比較先を番号で選べます。n / p でページ移動、q で中止します。
+複数コミットの変更を集約|multi モードで飛び飛びのコミットを複数選択し、各コミットの親との差分をファイル単位でまとめます。-c の繰り返し指定にも対応します。
 4 つの形式に同時出力|画面(色付き)・テキスト(.txt)・Markdown(.md)・Excel(.xlsx) へ一度に出力します。Excel を作れない環境では CSV へ自動的に切り替わります。
 旧・新の行番号を併記|差分明細に「変更前の行番号」と「変更後の行番号」を並べて表示するため、レビュー時に該当箇所をすぐ特定できます。
 追加ライブラリ不要|xlsx は素の XML と zip だけで生成します。openpyxl などの導入は不要で、閉じた環境でもそのまま使えます。
@@ -1819,7 +2016,7 @@ EOS
   done <<'EOS'
 1. 表紙・概要|できること / 使いはじめ方 / 動作要件
 2. セットアップ|配置・実行権限・依存コマンドの導入と動作確認
-3. モード一覧|9 種類の比較モードと、その選び方
+3. モード一覧|10 種類の比較モードと、その選び方
 4. オプション一覧|全オプションの引数・既定値・説明
 5. 使用例|目的別のコマンド例 (そのままコピーして使えます)
 6. 出力ファイル|出力されるファイルと Excel のシート構成・色分け
@@ -1892,7 +2089,7 @@ EOS
     MAN_Z=$((MAN_ROW % 2)); man_row "" label "$a" code "$b" plain "$c" plain "$d"
   done <<'EOS'
 ヘルプ表示|./git-diff-helper.sh --help|書式とオプション一覧が表示される|どこで実行しても構いません。
-モード一覧|./git-diff-helper.sh -l|9 モードの一覧が表示される|同上
+モード一覧|./git-diff-helper.sh -l|10 モードの一覧が表示される|同上
 実際の差分|./git-diff-helper.sh -m head|画面表示のあと出力ファイルの一覧が表示される|git リポジトリの中で実行してください。
 利用ガイド|./git-diff-helper.sh --manual-only|本ガイドの xlsx が生成される|git リポジトリの外でも実行できます。
 EOS
@@ -1914,7 +2111,7 @@ man_sheet_modes() {
     "別名でも指定できます (例: -m wt は -m worktree と同じ)    |    比較元 = 変更前 / 比較先 = 変更後"
 
   local a b c d e f
-  man_section "9 種類の比較モード"
+  man_section "10 種類の比較モード"
   man_head "モード" "別名" "比較元 (左)" "比較先 (右)" "実行される git コマンド" "こんなときに使う"
   while IFS='|' read -r a b c d e f; do
     [[ -z "$a" ]] && continue
@@ -1927,6 +2124,7 @@ prev|last|HEAD~N (N 個前のコミット)|HEAD (最新コミット)|git diff HE
 commit|(なし)|指定コミットの親|指定コミット|git diff <親> <指定>|特定の 1 コミットが加えた変更だけを見たいとき (-f で指定)
 commits|range|指定コミット (-f)|指定コミット (-t)|git diff <from> <to>|リリース間など、2 点間の変更をまとめたいとき
 interactive|select|一覧から選択 (変更前)|一覧から選択 (変更後)|git diff <from> <to>|ブランチ (既定 main) の履歴を10件ずつ見て2点を選びたいとき
+multi|multi-select|各コミットの第1親 (初回は空ツリー)|選択した各コミット|git diff <親> <コミット> を選択分実行|飛び飛びのコミットの変更をファイル単位でまとめたいとき。対話選択または -c を繰り返して指定
 branches|branch|分岐点 (共通祖先)|比較先ブランチ|git diff <from>...<to>|ブランチのレビュー。分岐後に加わった変更だけを見たいとき
 remote|upstream|リモート追跡ブランチ|ローカル HEAD|git diff <upstream> HEAD|push 前にリモートとの差を確認したいとき
 EOS
@@ -1939,6 +2137,7 @@ EOS
   man_tip "「未コミットの変更を全部まとめて見たい」  →  -m head  (迷ったらこれ)"
   man_tip "「さっきのコミットで何を変えたか見返したい」  →  -m prev  (3 件分なら -n 3)"
   man_tip "「履歴から2コミットを選びたい」  →  -m interactive  (ブランチ選択の既定は main、-b で変更)"
+  man_tip "「複数コミットの変更・追加をまとめたい」  →  -m multi  (対話なしなら -c <SHA> を繰り返し指定)"
   man_tip "「レビュー用にブランチの差分をまとめたい」  →  -m branches -f main -t <作業ブランチ>"
   man_tip "「push 前にリモートとの差を確認したい」  →  -m remote"
 
@@ -1946,6 +2145,11 @@ EOS
   man_note "interactive はブランチ番号／名前 → 比較元の番号 → 比較先の番号の順に選びます。各入力は Enter で確定し、n / p で次／前の10件、q で中止します。"
   man_note "interactive の番号はページごとに1～10です。比較先は最新ページから選び直します。同じコミットは選べません。選択順に二点比較し、自動で前後を入れ替えません。"
   man_note "interactive はローカル／リモート追跡ブランチを対象にし、チェックアウトや fetch は行いません。-f / -t / --merge-base は併用できません。"
+  man_note "multi は番号を空白／カンマで区切って選択・解除します (例: 1 3 / 1,3)。[x] が選択済み、n / p でページ移動、d で1件以上を確定、q で中止します。ページを移動しても選択は保持します。"
+  man_note "multi は各コミットの第1親との差分を選択順に集計します。未選択コミット自身の差分は含めませんが、コンテキストにはその時点の内容が表示されます。-U 0 で変更行だけにできます。"
+  man_note "multi の初回コミットは空ツリーと比較し、親が取得できない浅い履歴はエラーにします。マージには取り込まれた変更が含まれ、取り込み元も選ぶと重複計上する場合があります。"
+  man_note "multi の追加／削除行数は合算で、後で戻した変更も相殺しません。最終状態の差分ではありません。明細のコミットSHA・親SHAを確認し、行番号はそれぞれの親／対象コミットで参照してください。"
+  man_note "multi は -f / -t / --merge-base を併用できません。-c と --branch も併用できません。同一コミットを -c で重複指定しても1回だけ集計し、引数順に表示します。作業ファイルやインデックスは変更しません。"
   man_note "三点比較 (A...B) は「A から分岐した後に B 側で加えられた変更」を表示します。branches / remote モードの既定動作で、レビューに適しています。--no-merge-base を付けると先端同士の二点比較になります。"
   man_note "コミットが 1 件も無いリポジトリや、履歴数を超える -n を指定した場合は、自動的に「空ツリー (ファイルが 1 つも無い状態)」との比較へフォールバックします。"
   man_note "-t を省略した場合、commits / branches モードでは比較先が HEAD になります。remote モードでは追跡ブランチを自動判定します。"
@@ -1968,7 +2172,8 @@ man_sheet_options() {
   done <<'EOS'
 比較対象|-f|--from|<REF>|(モード依存)|比較元。コミット / ブランチ / タグ / SHA を指定します。commit モードでは対象コミットの指定に使います。
 比較対象|-t|--to|<REF>|HEAD|比較先。省略時は HEAD を使用します。remote モードでは追跡先の明示指定に使えます。
-比較対象|-b|--branch|<BRANCH>|main|interactive のブランチ選択で Enter を押したときの既定値。ブランチ名 (例 develop / origin/main) を指定します。
+比較対象|-b|--branch|<BRANCH>|main|interactive / multi のブランチ選択で Enter を押したときの既定値。ブランチ名 (例 develop / origin/main) を指定します。
+比較対象|-c|--commit|<REF>|(対話選択)|multi の対象コミット。繰り返し指定でき、コミットSHAに解決して重複を除きます。省略すると対話で複数選択します。
 比較対象|-n|--back|<N>|1|prev モードで N 個前のコミット (HEAD~N) と比較します。1 以上の整数を指定します。
 比較対象|(なし)|--merge-base|(なし)|branches/remote で有効|三点比較 (A...B)。分岐後に加えられた変更のみを表示します。
 比較対象|(なし)|--no-merge-base|(なし)|(なし)|二点比較 (A B)。2 つの先端の状態をそのまま比較します。
@@ -2050,6 +2255,8 @@ man_sheet_examples() {
 24|利用ガイドだけを作る|./git-diff-helper.sh --manual-only -o ./docs|本ファイルを再生成します。
 25|ブランチの履歴から2コミットを選ぶ|./git-diff-helper.sh -m interactive|Enter で main。番号で比較元／比較先を選び、n / p で10件ずつ移動します。
 26|別ブランチを既定にして履歴を選ぶ|./git-diff-helper.sh -m interactive -b develop -r /srv/git/myapp|チェックアウト中のブランチを変更せずに比較します。
+27|飛び飛びのコミットを複数選択する|./git-diff-helper.sh -m multi|番号を空白／カンマで区切って選択・解除。n / p でページ移動、d で確定します。
+28|対象コミットを指定して集約する|./git-diff-helper.sh -m multi -c a1b2c3d -c f9e8d7c -- src/|対話なしで指定した各コミットの変更をファイル単位でまとめます。
 EOS
   MAN_Z=0
   man_filter
@@ -2093,7 +2300,7 @@ EOS
 サマリ|項目 / 内容|実行条件と集計値。まずここを確認します。|実行コマンドも記録されるため再現できます。
 ファイル一覧|No / 状態 / 状態コード / 追加行 / 削除行 / 変更行合計 / 種別 / ファイル(新) / ファイル(旧)|変更されたファイルの一覧。|オートフィルタで状態や種別を絞り込めます。
 差分明細|No / ファイルNo / ファイル / ハンク / 旧行番号 / 新行番号 / 区分 / 記号 / 内容|1 行 1 レコードの差分本体。|区分やファイル名で絞り込めます。既定 100,000 行まで。
-コミット履歴|No / コミット / 日時 / 作成者 / 件名|対象範囲のコミット一覧。|prev / commit / commits / interactive / branches / remote モードで出力されます。
+コミット履歴|No / コミット / 日時 / 作成者 / 件名|対象範囲のコミット一覧。multi は選択コミットのみ。|prev / commit / commits / interactive / multi / branches / remote モードで出力されます。
 EOS
   MAN_Z=0
 
@@ -2131,7 +2338,7 @@ man_sheet_reading() {
 [ 実行条件 ]|実行日時・リポジトリ・ブランチ・HEAD・モード・比較内容・実行コマンドなど、再現に必要な情報です。
 [ 差分サマリ ]|変更ファイル数 / 追加行数 / 削除行数 / 差引行数 / 状態の内訳。全体の規模をつかみます。
 [ ファイル別サマリ ]|No・状態・追加・削除・変化量バー・ファイル名。どのファイルが大きく変わったか一目で分かります。
-[ 対象コミット一覧 ]|prev / commit / commits / interactive / branches / remote モードでのみ表示されます。
+[ 対象コミット一覧 ]|prev / commit / commits / interactive / multi / branches / remote モードでのみ表示されます。multi は選択コミットのみを選択順に表示します。
 [ 差分明細 ]|ファイルごとに、ハンク見出しと変更行を「旧行番号・新行番号・記号・内容」の形で表示します。
 EOS
   MAN_Z=0
@@ -2212,6 +2419,8 @@ Markdown が不要|—|--no-md を指定してください。テキストのみ�
 cron から実行したい|—|--no-screen を付け、-o で出力先を固定してください。終了コード 0 が正常終了です。
 interactive で main が見つからない|対象リポジトリに main が無い|一覧から別の番号／名前を入力するか、-b develop などで既定値を変更してください。タグや任意の SHA は選択対象外です。
 interactive で選択できない／入力が終了する|コミット不足、同一コミットの選択、標準入力の EOF|2件以上の履歴から異なる2コミットを選びます。無人実行には -m commits -f <元> -t <先> を使用してください。
+multi の行数が2点比較と異なる|各コミットの追加／削除行数を合算している|後で戻した変更も相殺しません。明細はコミットSHA・親SHAで区切って表示します。最終状態の比較には commits を使います。
+multi で確定できない／親コミットが取得できない|未選択、標準入力の EOF、浅い履歴|番号で1件以上を選んで d で確定します。無人実行は -c を繰り返し指定してください。親が無い場合は不足する履歴を取得して再実行します。
 改行コードが CRLF のファイルがある|—|行末の CR は除去して表示します。そのままご利用いただけます。
 EOS
   MAN_Z=0
@@ -2219,13 +2428,14 @@ EOS
 
   man_section "終了コード"
   man_head "コード" "意味" "補足"
-  man_row "" center 0 plain "正常終了" plain "差分の有無にかかわらず 0 を返します。interactive で q により中止した場合も 0 です (レポートは出力しません)。"
+  man_row "" center 0 plain "正常終了" plain "差分の有無にかかわらず 0 を返します。interactive / multi で q により中止した場合も 0 です (レポートは出力しません)。"
   man_row "" center 1 plain "エラー終了" plain "引数エラー / リポジトリ不正 / 参照の解決失敗 / 出力失敗など。標準エラー出力にメッセージを表示します。"
 
   man_section "制限事項"
   man_note "パス名に改行を含むファイルは正しく扱えません (-z 出力を行単位で解析しているため)。通常の運用では発生しません。"
   man_note "差分明細シートは既定で 100,000 行を上限としています (Excel の実用上の制約)。--excel-max-rows で変更できます。"
   man_note "バイナリファイルは変更の有無のみを記録し、内容の差分は表示しません。"
+  man_note "multi は変更後のパス単位 (削除は変更前) で集約し、改名前後を追跡しません。状態が混在する場合は変更 (M)、状態コード欄は A/M などの内訳です。--max-lines は集約後の1ファイル全体に適用します。"
   man_note "画面の罫線は UTF-8 ロケールを自動検出して選択します。全角文字の桁揃えのため、非 UTF-8 環境では awk のみ UTF-8 ロケールで起動します (出力は常に UTF-8)。"
   man_sheet_end
 }

@@ -1,0 +1,2 @@
+1	1	common file.txt
+1	0	追加.txt

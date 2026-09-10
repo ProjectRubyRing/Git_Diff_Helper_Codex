@@ -1,5 +1,6 @@
 """CLI integration tests using disposable Git repositories and real Bash."""
 
+import csv
 import os
 from pathlib import Path
 import re
@@ -338,9 +339,197 @@ class GitDiffHelperTests(unittest.TestCase):
                         ET.fromstring(archive.read(name))
                 if manual:
                     self.assertIn("interactive", archive.read("xl/worksheets/sheet3.xml").decode())
+                    self.assertIn("multi", archive.read("xl/worksheets/sheet3.xml").decode())
                     self.assertIn("--branch", archive.read("xl/worksheets/sheet4.xml").decode())
+                    self.assertIn("--commit", archive.read("xl/worksheets/sheet4.xml").decode())
                 else:
                     self.assertIn("refs/heads/main", archive.read("xl/worksheets/sheet1.xml").decode())
+
+    def assert_selected_diff(self, result, commits, paths=(), repo=None, diff_options=()):
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reports = list(self.output.glob("*.txt"))
+        self.assertEqual(len(reports), 1)
+        report = reports[0].read_text(encoding="utf-8")
+        raw = report.split(" 【参考】生の git diff 出力\n", 1)[1].split("\n", 2)[2]
+        expected = []
+        for commit in commits:
+            parents = self.git("cat-file", "-p", commit, repo=repo).split("\n\n", 1)[0]
+            parents = re.findall(r"^parent (\w+)$", parents, re.M)
+            parent = parents[0] if parents else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            expected.append(f"# commit: {commit}\n# parent: {parent}\n")
+            expected.append(self.git("-c", "core.quotepath=false", "diff", "--no-ext-diff",
+                                     "--no-color", "-M", "-U3", *diff_options, parent,
+                                     commit, "--", *paths, repo=repo))
+        self.assertEqual(raw, "".join(expected))
+        history = report.split("[ 対象コミット一覧 ]", 1)[1].split("[ 差分明細 ]", 1)[0]
+        self.assertEqual(re.findall(r"^\s+([0-9a-f]{40})\s", history, re.M), commits)
+        self.assertNotIn("[ 複数コミット選択 ]", result.stdout)
+        return report
+
+    def read_csv_sheet(self, sheet):
+        paths = list(self.output.glob(f"*_{sheet}.csv"))
+        self.assertEqual(len(paths), 1)
+        with paths[0].open(encoding="utf-8-sig", newline="") as stream:
+            return list(csv.reader(stream))
+
+    def test_multi_nonadjacent_commits_aggregate_files_and_exclude_skipped_changes(self):
+        selected = [self.commits[20], self.commits[22]]
+        command = [arg for arg in self.command("-m", "multi", "-c", selected[0], "-c",
+                                               selected[1], "-x", "csv", "--", "tracked file.txt")
+                   if arg != "--no-excel"]
+        result = subprocess.run(command, input="", env=self.env, capture_output=True,
+                                text=True, encoding="utf-8", timeout=30)
+        report = self.assert_selected_diff(result, selected, ("tracked file.txt",))
+        self.assertNotIn("+line 22\n", report)
+        self.assertIn("+line 21\n", report)
+        self.assertIn("+line 23\n", report)
+        files = self.read_csv_sheet("ファイル一覧")
+        self.assertEqual(len(files), 2)
+        self.assertEqual(files[1][3:6], ["2", "0", "2"])
+        details = self.read_csv_sheet("差分明細")
+        self.assertTrue(all(row[1] == "1" for row in details[1:]))
+        self.assertEqual([row[5] for row in details[1:] if row[7] == "+"], ["21", "23"])
+
+    def test_multi_interactive_toggle_duplicates_and_cross_page_selection(self):
+        result = self.run_helper("\n1,3,3\nn\n1\np\n3\nd\n", "multi-select")
+        self.assert_selected_diff(result, [self.commits[22], self.commits[12]])
+        self.assertIn("[x]", result.stderr)
+        self.assertIn("選択済み: 3 件", result.stderr)
+        self.assertIn("refs/heads/main", result.stdout)
+
+    def test_multi_invalid_numbers_do_not_partially_change_selection(self):
+        result = self.run_helper(
+            "\nd\n1 99\n01\n1+1\n999999999999999999999\n\np\n1 3\nd\n",
+            "-m", "multi",
+        )
+        self.assert_selected_diff(result, [self.commits[22], self.commits[20]])
+        self.assertIn("1件以上", result.stderr)
+        self.assertIn("最初のページ", result.stderr)
+
+    def test_multi_last_page_and_root_commit(self):
+        result = self.run_helper("\nn\nn\nn\n3\nd\n", "-m", "multi")
+        self.assert_selected_diff(result, [self.commits[0]])
+        self.assertIn("最後のページ", result.stderr)
+        self.assertIn("new file mode", result.stdout)
+
+    def test_multi_single_commit_branch_and_empty_repository(self):
+        result = self.run_helper("\n1\nd\n", "-m", "multi", "-b", "single")
+        self.assert_selected_diff(result, [self.commits[0]])
+        result = self.run_helper("", "-m", "multi", repo=self.empty)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("選択できるブランチがありません", result.stderr)
+
+    def test_multi_empty_selection_cancel_and_eof_create_no_report(self):
+        for input_text in ("q\n", "\nq\n", "\n1\nq\n", "\n1\n1\nd\nq\n",
+                           "", "\n", "\n1\n"):
+            with self.subTest(input=input_text):
+                result = self.run_helper(input_text, "-m", "multi")
+                self.assertEqual(result.returncode, 0 if "q" in input_text else 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertFalse(self.output.exists())
+
+    def test_multi_explicit_refs_deduplicate_and_preserve_order(self):
+        result = self.run_helper("", "-m", "multi", "-c", "refs/heads/main", "--commit",
+                                 self.commits[-1][:12], "-c", self.commits[0], "-c", "refs/tags/main")
+        self.assert_selected_diff(result, [self.commits[-1], self.commits[0]])
+        self.assertNotIn("[ ブランチ選択 ]", result.stderr)
+
+    def test_multi_option_errors_happen_before_selection_or_output(self):
+        for args in (("-m", "multi", "-f", "HEAD"), ("-m", "multi", "-t", "HEAD"),
+                     ("-m", "multi", "--merge-base"), ("-m", "multi", "--commit"),
+                     ("-m", "multi", "-c", ""), ("-m", "multi", "-c", "missing"),
+                     ("-m", "multi", "-c", "--all"),
+                     ("-m", "multi", "-c", "HEAD", "-b", "main"),
+                     ("-m", "multi", "-c", "HEAD", "-c", "missing"),
+                     ("-m", "head", "-c", "HEAD")):
+            with self.subTest(args=args):
+                result = self.run_helper("", *args)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertNotIn("[ ブランチ選択 ]", result.stderr)
+                self.assertFalse(self.output.exists())
+
+    def test_multi_merge_uses_first_parent_and_only_selected_history(self):
+        merge = self.git("rev-parse", "HEAD").strip()
+        result = self.run_helper("", "-m", "multi", "-c", merge)
+        self.assert_selected_diff(result, [merge])
+
+    def test_multi_no_matching_paths_still_lists_selected_commits(self):
+        result = self.run_helper("", "-m", "multi", "-c", self.commits[5], "-c",
+                                 self.commits[9], "--", "missing-path/")
+        self.assert_selected_diff(result, [self.commits[5], self.commits[9]], ("missing-path/",))
+        self.assertIn("差分はありません", result.stdout)
+
+    def test_multi_diff_options_and_file_display_limit(self):
+        selected = [self.commits[20], self.commits[22]]
+        options = ("--no-renames", "-w")
+        result = self.run_helper("", "-m", "multi", "-c", selected[0], "-c", selected[1],
+                                 *options, "-U", "0", "--max-lines", "2", "--", "tracked file.txt")
+        self.assert_selected_diff(result, selected, ("tracked file.txt",),
+                                  diff_options=(*options, "-U0"))
+        self.assertIn("表示上限 (2 行)", result.stdout)
+
+    def test_multi_rename_binary_delete_and_revert_remain_visible(self):
+        repo = self.root / "multi file changes"
+        self.make_repo(repo, "main", 1)
+        path = repo / "追加 ファイル.txt"
+        path.write_text("original\n", encoding="utf-8")
+        (repo / "binary.dat").write_bytes(b"\0original")
+        self.git("add", "--", ".", repo=repo)
+        self.git("commit", "-qm", "add files", repo=repo)
+        added = self.git("rev-parse", "HEAD", repo=repo).strip()
+        path.write_text("modified\n", encoding="utf-8")
+        self.git("commit", "-qam", "modify", repo=repo)
+        modified = self.git("rev-parse", "HEAD", repo=repo).strip()
+        path.write_text("original\n", encoding="utf-8")
+        self.git("commit", "-qam", "restore", repo=repo)
+        restored = self.git("rev-parse", "HEAD", repo=repo).strip()
+        self.git("mv", "--", path.name, "改名 ファイル.txt", repo=repo)
+        (repo / "binary.dat").write_bytes(b"\0changed")
+        self.git("commit", "-qam", "rename and binary", repo=repo)
+        renamed = self.git("rev-parse", "HEAD", repo=repo).strip()
+        self.git("rm", "--", "改名 ファイル.txt", repo=repo)
+        self.git("commit", "-qm", "delete", repo=repo)
+        deleted = self.git("rev-parse", "HEAD", repo=repo).strip()
+        commits = [added, modified, restored, renamed, deleted]
+        args = [arg for commit in commits for arg in ("-c", commit)]
+        result = self.run_helper("", "-m", "multi", *args, repo=repo)
+        report = self.assert_selected_diff(result, commits, repo=repo)
+        self.assertIn("+modified\n", report)
+        self.assertIn("-modified\n", report)
+        self.assertIn("rename from", report)
+        self.assertIn("[バイナリ]", report)
+        self.assertIn("状態: D", report)
+
+    def test_multi_shallow_parent_is_an_error(self):
+        shallow = self.root / "shallow multi"
+        self.git("clone", "-q", "--depth=1", "--branch", "main", self.repo.as_uri(),
+                 str(shallow))
+        result = self.run_helper("", "-m", "multi", "-c", "HEAD", repo=shallow)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("親コミットが取得できません", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_multi_outputs_and_worktree_are_preserved(self):
+        commands = (("symbolic-ref", "HEAD"), ("status", "--porcelain=v1", "-z"),
+                    ("diff", "--binary"), ("diff", "--cached", "--binary"),
+                    ("for-each-ref", "--format=%(refname) %(objectname)"))
+        before = [self.git(*args) for args in commands]
+        selected = [self.commits[0], self.commits[22]]
+        command = [arg for arg in self.command("-m", "multi", "-c", selected[0], "-c",
+                                               selected[1], "-x", "xlsx")
+                   if arg not in ("--no-md", "--no-excel")]
+        result = subprocess.run(command, input="", env=self.env, capture_output=True,
+                                text=True, encoding="utf-8", timeout=60)
+        self.assert_selected_diff(result, selected)
+        self.assertEqual([self.git(*args) for args in commands], before)
+        markdown = next(self.output.glob("*.md")).read_text(encoding="utf-8")
+        self.assertIn("選択コミット数", markdown)
+        self.assertEqual(len(re.findall(r"^### \[\d+/2\]", markdown, re.M)), 2)
+        with zipfile.ZipFile(next(self.output.glob("*.xlsx"))) as archive:
+            for name in archive.namelist():
+                if name.endswith((".xml", ".rels")):
+                    ET.fromstring(archive.read(name))
+            self.assertIn("コミット: " + selected[0], archive.read("xl/worksheets/sheet3.xml").decode())
 
 
 if __name__ == "__main__":

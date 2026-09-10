@@ -1,0 +1,11 @@
+<row r="1" ht="24" customHeight="1"><c r="A1" s="3" t="inlineStr"><is><t xml:space="preserve">Git 差分レポート</t></is></c></row>
+<row r="2"/>
+<row r="3"><c r="A3" s="2" t="inlineStr"><is><t xml:space="preserve">項目</t></is></c><c r="B3" s="2" t="inlineStr"><is><t xml:space="preserve">内容</t></is></c></row>
+<row r="4"/>
+<row r="5"><c r="A5" s="2" t="inlineStr"><is><t xml:space="preserve">集計</t></is></c><c r="B5" s="2" t="inlineStr"><is><t xml:space="preserve">値</t></is></c></row>
+<row r="6"><c r="A6" s="4" t="inlineStr"><is><t xml:space="preserve">変更ファイル数</t></is></c><c r="B6" s="6"><v>2</v></c></row>
+<row r="7"><c r="A7" s="4" t="inlineStr"><is><t xml:space="preserve">追加行数</t></is></c><c r="B7" s="10"><v>4</v></c></row>
+<row r="8"><c r="A8" s="4" t="inlineStr"><is><t xml:space="preserve">削除行数</t></is></c><c r="B8" s="12"><v>1</v></c></row>
+<row r="9"><c r="A9" s="4" t="inlineStr"><is><t xml:space="preserve">差引行数</t></is></c><c r="B9" s="6"><v>3</v></c></row>
+<row r="10"><c r="A10" s="4" t="inlineStr"><is><t xml:space="preserve">差分明細 行数</t></is></c><c r="B10" s="6"><v>7</v></c></row>
+<row r="11"><c r="A11" s="4" t="inlineStr"><is><t xml:space="preserve">対象コミット数</t></is></c><c r="B11" s="6"><v>2</v></c></row>

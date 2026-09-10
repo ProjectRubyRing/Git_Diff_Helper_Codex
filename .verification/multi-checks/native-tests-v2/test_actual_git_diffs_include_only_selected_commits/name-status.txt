@@ -1,0 +1,4 @@
+M
+common file.txt
+A
+追加.txt
